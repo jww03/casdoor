@@ -219,13 +219,13 @@ func (c *ApiController) TestSyncerDb() {
 		return
 	}
 
-	err = object.TestSyncer(syncer)
+	warning, err := object.TestSyncer(syncer)
 	if err != nil {
 		c.ResponseError(err.Error())
 		return
 	}
 
-	c.ResponseOk()
+	c.ResponseJsonData(&Response{Status: "ok", Msg: warning})
 }
 
 func (c *ApiController) checkSyncerDatabase(syncer *object.Syncer) bool {

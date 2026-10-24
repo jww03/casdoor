@@ -108,6 +108,12 @@ func (syncer *Syncer) updateUserForOriginalFields(user *User, key string) (bool,
 	case "Lark":
 		columns = append(columns, "lark", "groups")
 		user.Groups = mergeLarkDepartmentGroups(oldUser.Groups, user.Groups)
+		for _, column := range []string{"location", "region", "bio", "properties"} {
+			if !slices.Contains(columns, column) {
+				columns = append(columns, column)
+			}
+		}
+		mergeLarkProfile(&oldUser, user)
 	}
 
 	// The group APIs read memberships from the user enforcer, not from the groups column. It is
@@ -178,6 +184,12 @@ func (syncer *Syncer) calculateHash(user *OriginalUser) string {
 		groups := slices.Clone(user.Groups)
 		slices.Sort(groups)
 		values = append(values, strings.Join(groups, ","))
+	}
+	// Likewise for the synced profile fields, so that users without any keep their old hash
+	if syncer.Type == "Lark" {
+		if profile := getLarkProfileHash(user); profile != "" {
+			values = append(values, profile)
+		}
 	}
 
 	s := strings.Join(values, "|")

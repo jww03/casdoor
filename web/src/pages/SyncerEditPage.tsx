@@ -346,7 +346,9 @@ export default function SyncerEditPage() {
           onClick={() => {
             SyncerBackend.testSyncerDb(ctx.record)
               .then((res: any) => {
-                if (res.status === "ok") {
+                if (res.status === "ok" && res.msg) {
+                  Setting.showMessage("warning", `${i18next.t("syncer:Connect successfully")}: ${res.msg}`);
+                } else if (res.status === "ok") {
                   Setting.showMessage("success", i18next.t("syncer:Connect successfully"));
                 } else {
                   Setting.showMessage("error", `${i18next.t("syncer:Failed to connect")}: ${res.msg}`);

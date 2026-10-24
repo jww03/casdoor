@@ -367,10 +367,16 @@ func RunSyncer(syncer *Syncer) error {
 	return syncer.syncUsers()
 }
 
-func TestSyncer(syncer Syncer) error {
+// syncerConnectionWarner is a SyncerProvider whose connection test can pass with warnings
+type syncerConnectionWarner interface {
+	TestConnectionWithWarnings() (string, error)
+}
+
+// TestSyncer tests the connection of a syncer and returns the warnings of a successful test, if any
+func TestSyncer(syncer Syncer) (string, error) {
 	oldSyncer, err := getSyncer(syncer.Owner, syncer.Name)
 	if err != nil {
-		return err
+		return "", err
 	}
 
 	// the syncer may not be created yet when the connection is tested from the syncer add page
@@ -379,7 +385,10 @@ func TestSyncer(syncer Syncer) error {
 	}
 
 	provider := GetSyncerProvider(&syncer)
-	return provider.TestConnection()
+	if warner, ok := provider.(syncerConnectionWarner); ok {
+		return warner.TestConnectionWithWarnings()
+	}
+	return "", provider.TestConnection()
 }
 
 func (syncer *Syncer) Close() error {

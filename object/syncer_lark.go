@@ -16,6 +16,7 @@ package object
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -59,25 +60,11 @@ func (p *LarkSyncerProvider) UpdateUser(user *OriginalUser) (bool, error) {
 	return false, fmt.Errorf("updating users in Lark is not supported")
 }
 
-// TestConnection tests the Lark API connection and the root departments of the syncer
+// TestConnection tests the Lark API connection, the root departments of the syncer and that
+// some users are visible; see TestConnectionWithWarnings
 func (p *LarkSyncerProvider) TestConnection() error {
-	accessToken, err := p.getLarkAccessToken()
-	if err != nil {
-		return err
-	}
-
-	// A wrong root would make the next sync forbid every user outside of it
-	for _, rootId := range parseLarkRootDepartmentIds(p.Syncer.RootDepartmentIds) {
-		if rootId == "0" {
-			continue
-		}
-		_, err = p.getLarkRootDepartment(accessToken, rootId)
-		if err != nil {
-			return err
-		}
-	}
-
-	return nil
+	_, err := p.TestConnectionWithWarnings()
+	return err
 }
 
 // Close closes any open connections (no-op for Lark API-based syncer)
@@ -107,6 +94,109 @@ type LarkUser struct {
 	Status          *LarkStatus `json:"status"`
 	DepartmentIds   []string    `json:"department_ids"`
 	JobTitle        string      `json:"job_title"`
+
+	Nickname        larkLooseString `json:"nickname"`
+	Description     larkLooseString `json:"description"`
+	EmployeeNo      larkLooseString `json:"employee_no"`
+	JoinTime        larkLooseInt    `json:"join_time"`
+	City            larkLooseString `json:"city"`
+	Country         larkLooseString `json:"country"`
+	LeaderUserId    larkLooseString `json:"leader_user_id"`
+	EmployeeType    larkLooseInt    `json:"employee_type"`
+	IsTenantManager *larkLooseBool  `json:"is_tenant_manager"`
+	CustomAttrs     larkCustomAttrs `json:"custom_attrs"`
+}
+
+// LarkCustomAttr is a custom field of a Lark user; which value field is set depends on the type
+type LarkCustomAttr struct {
+	Type  string `json:"type"`
+	Id    string `json:"id"`
+	Value struct {
+		Text        string `json:"text"`
+		Url         string `json:"url"`
+		PcUrl       string `json:"pc_url"`
+		OptionId    string `json:"option_id"`
+		OptionValue string `json:"option_value"`
+		Name        string `json:"name"`
+		PictureUrl  string `json:"picture_url"`
+		GenericUser *struct {
+			Id string `json:"id"`
+		} `json:"generic_user"`
+	} `json:"value"`
+}
+
+// The loose types below decode the optional profile fields so that a value of an unexpected
+// type is dropped instead of failing the whole user listing.
+type (
+	larkLooseString string
+	larkLooseInt    int64
+	larkLooseBool   bool
+	larkCustomAttrs []*LarkCustomAttr
+)
+
+func decodeLarkLooseValue(data []byte) interface{} {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.UseNumber()
+	var value interface{}
+	if decoder.Decode(&value) != nil {
+		return nil
+	}
+	return value
+}
+
+func (s *larkLooseString) UnmarshalJSON(data []byte) error {
+	switch value := decodeLarkLooseValue(data).(type) {
+	case string:
+		*s = larkLooseString(value)
+	case json.Number:
+		*s = larkLooseString(value.String())
+	default:
+		*s = ""
+	}
+	return nil
+}
+
+func (i *larkLooseInt) UnmarshalJSON(data []byte) error {
+	*i = 0
+	var number json.Number
+	switch value := decodeLarkLooseValue(data).(type) {
+	case json.Number:
+		number = value
+	case string:
+		number = json.Number(strings.TrimSpace(value))
+	}
+	if n, err := number.Int64(); err == nil {
+		*i = larkLooseInt(n)
+	}
+	return nil
+}
+
+func (b *larkLooseBool) UnmarshalJSON(data []byte) error {
+	switch value := decodeLarkLooseValue(data).(type) {
+	case bool:
+		*b = larkLooseBool(value)
+	case string:
+		parsed, _ := strconv.ParseBool(strings.TrimSpace(value))
+		*b = larkLooseBool(parsed)
+	default:
+		*b = false
+	}
+	return nil
+}
+
+func (a *larkCustomAttrs) UnmarshalJSON(data []byte) error {
+	*a = nil
+	var items []json.RawMessage
+	if json.Unmarshal(data, &items) != nil {
+		return nil
+	}
+	for _, item := range items {
+		attr := &LarkCustomAttr{}
+		if json.Unmarshal(item, attr) == nil && attr.Id != "" {
+			*a = append(*a, attr)
+		}
+	}
+	return nil
 }
 
 type LarkAvatar struct {
@@ -668,13 +758,159 @@ func (p *LarkSyncerProvider) getLarkUsers() ([]*OriginalUser, error) {
 
 	// Convert Lark users to Casdoor OriginalUser
 	originalUsers := []*OriginalUser{}
+	larkUsers := []*LarkUser{}
+	userIds := &larkUserIds{byOpenId: map[string]string{}, byUserId: map[string]string{}}
 	for _, larkUser := range userMap {
 		originalUser := p.larkUserToOriginalUser(larkUser)
 		originalUser.Groups = p.getLarkUserGroupIds(larkUser, listedDeptIds[larkUser.OpenId], depts)
 		originalUsers = append(originalUsers, originalUser)
+		larkUsers = append(larkUsers, larkUser)
+		userId := util.GetId(p.Syncer.Organization, originalUser.Name)
+		userIds.byOpenId[larkUser.OpenId] = userId
+		if larkUser.UserId != "" {
+			userIds.byUserId[larkUser.UserId] = userId
+		}
+	}
+
+	// Leaders and user custom fields point at open_ids, which become Casdoor user IDs once all users are known
+	for i, originalUser := range originalUsers {
+		originalUser.Properties = p.getLarkUserProperties(larkUsers[i], userIds)
 	}
 
 	return originalUsers, nil
+}
+
+// larkPropertyPrefix marks the user properties owned by the Lark syncer
+const larkPropertyPrefix = "lark_"
+
+var larkEmployeeTypes = map[int64]string{
+	1: "regular",
+	2: "intern",
+	3: "outsourcing",
+	4: "labor",
+	5: "consultant",
+}
+
+// truncateLarkValue fits a synced value into the varchar(100) user columns
+func truncateLarkValue(value string) string {
+	runes := []rune(value)
+	if len(runes) > 100 {
+		runes = runes[:100]
+	}
+	return string(runes)
+}
+
+// larkProfileFields are the Lark fields that TableColumns may map since the profile sync, whose
+// values may not fit the column they are mapped to
+var larkProfileFields = []string{"nickname", "description", "employee_no", "city", "country", "leader_user_id"}
+
+// larkUserIds maps the open_ids and user_ids of the synced users to their Casdoor user IDs
+type larkUserIds struct {
+	byOpenId map[string]string
+	byUserId map[string]string
+}
+
+// getLarkUserProperties returns the "lark_" properties of a user. Users that are not in userIds
+// (nil before all users are known) are referred to by their Lark ID.
+func (p *LarkSyncerProvider) getLarkUserProperties(larkUser *LarkUser, userIds *larkUserIds) map[string]string {
+	properties := map[string]string{}
+	set := func(key string, value string) {
+		if value != "" {
+			properties[larkPropertyPrefix+key] = value
+		}
+	}
+	userRef := func(id string, byUserId bool) string {
+		if userIds == nil {
+			return id
+		}
+		if userId, ok := userIds.byOpenId[id]; ok {
+			return userId
+		}
+		// A custom field may refer to a user by user_id
+		if userId, ok := userIds.byUserId[id]; ok && byUserId {
+			return userId
+		}
+		return id
+	}
+
+	set("employee_no", string(larkUser.EmployeeNo))
+	if larkUser.JoinTime > 0 {
+		set("join_time", time.Unix(int64(larkUser.JoinTime), 0).UTC().Format(time.RFC3339))
+	}
+	set("en_name", larkUser.EnName)
+	set("nickname", string(larkUser.Nickname))
+	if larkUser.EmployeeType != 0 {
+		employeeType, ok := larkEmployeeTypes[int64(larkUser.EmployeeType)]
+		if !ok {
+			// A tenant-defined type, whose name needs another API
+			employeeType = strconv.FormatInt(int64(larkUser.EmployeeType), 10)
+		}
+		set("employee_type", employeeType)
+	}
+	if larkUser.IsTenantManager != nil {
+		set("is_tenant_manager", strconv.FormatBool(bool(*larkUser.IsTenantManager)))
+	}
+	set("leader", userRef(string(larkUser.LeaderUserId), false))
+
+	for _, attr := range larkUser.CustomAttrs {
+		value := attr.Value
+		var display string
+		switch attr.Type {
+		case "HREF":
+			display = cmp.Or(value.Url, value.PcUrl, value.Text)
+		case "ENUMERATION":
+			display = cmp.Or(value.OptionValue, value.OptionId)
+		case "PICTURE_ENUM":
+			display = cmp.Or(value.Name, value.OptionValue, value.PictureUrl, value.OptionId)
+		case "GENERIC_USER":
+			if value.GenericUser != nil {
+				display = userRef(value.GenericUser.Id, true)
+			}
+		default:
+			display = cmp.Or(value.Text, value.OptionValue, value.Url)
+		}
+		set("custom_"+attr.Id, display)
+	}
+
+	return properties
+}
+
+// mergeLarkProfile keeps what an admin set by hand on an existing user: properties that are not
+// "lark_" ones, and the location, region and bio when Lark has none
+func mergeLarkProfile(oldUser *User, user *User) {
+	user.Location = cmp.Or(user.Location, oldUser.Location)
+	user.Region = cmp.Or(user.Region, oldUser.Region)
+	user.Bio = cmp.Or(user.Bio, oldUser.Bio)
+
+	properties := map[string]string{}
+	for key, value := range oldUser.Properties {
+		if !strings.HasPrefix(key, larkPropertyPrefix) {
+			properties[key] = value
+		}
+	}
+	for key, value := range user.Properties {
+		if strings.HasPrefix(key, larkPropertyPrefix) {
+			properties[key] = value
+		}
+	}
+	user.Properties = properties
+}
+
+// getLarkProfileHash returns the synced profile fields of a user in a stable order, "" if all are empty
+func getLarkProfileHash(user *OriginalUser) string {
+	values := []string{}
+	for key, value := range map[string]string{"location": user.Location, "region": user.Region, "bio": user.Bio} {
+		if value != "" {
+			values = append(values, key+"="+value)
+		}
+	}
+	for key, value := range user.Properties {
+		if strings.HasPrefix(key, larkPropertyPrefix) && value != "" {
+			values = append(values, key+"="+value)
+		}
+	}
+	slices.Sort(values)
+	return strings.Join(values, "\n")
 }
 
 // getLarkUserGroupIds returns the group IDs of the user's departments covered by the syncer, from
@@ -713,6 +949,18 @@ func (p *LarkSyncerProvider) getLarkUserFieldValue(larkUser *LarkUser, field str
 		return larkUser.Mobile, true
 	case "job_title":
 		return larkUser.JobTitle, true
+	case "nickname":
+		return string(larkUser.Nickname), true
+	case "description":
+		return string(larkUser.Description), true
+	case "employee_no":
+		return string(larkUser.EmployeeNo), true
+	case "city":
+		return string(larkUser.City), true
+	case "country":
+		return string(larkUser.Country), true
+	case "leader_user_id":
+		return string(larkUser.LeaderUserId), true
 	default:
 		return "", false
 	}
@@ -743,8 +991,11 @@ func (p *LarkSyncerProvider) larkUserToOriginalUser(larkUser *LarkUser) *Origina
 		Email:       email,
 		Phone:       larkUser.Mobile,
 		Title:       larkUser.JobTitle,
+		Location:    truncateLarkValue(strings.TrimSpace(string(larkUser.City))),
+		Region:      truncateLarkValue(strings.TrimSpace(string(larkUser.Country))),
+		Bio:         truncateLarkValue(strings.TrimSpace(string(larkUser.Description))),
 		Address:     []string{},
-		Properties:  map[string]string{},
+		Properties:  p.getLarkUserProperties(larkUser, nil),
 		Groups:      []string{},
 		Lark:        larkUser.OpenId, // Must match idp.LarkIdProvider's UserInfo.Id.
 	}
@@ -755,6 +1006,9 @@ func (p *LarkSyncerProvider) larkUserToOriginalUser(larkUser *LarkUser) *Origina
 	// cannot blank the fallbacks above when the app cannot read those fields.
 	for _, tableColumn := range p.Syncer.TableColumns {
 		if value, ok := p.getLarkUserFieldValue(larkUser, tableColumn.Name); ok && value != "" {
+			if slices.Contains(larkProfileFields, tableColumn.Name) {
+				value = truncateLarkValue(value)
+			}
 			p.Syncer.setUserByKeyValue(user, tableColumn.CasdoorName, value)
 		}
 	}
